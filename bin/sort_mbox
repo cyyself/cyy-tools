@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+
+import mailbox
+import sys
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: sort_mbox <input_mbox> <output_mbox>")
+        sys.exit(1)
+
+    input_mbox_path = sys.argv[1]
+    output_mbox_path = sys.argv[2]
+
+    # Open the input mbox file
+    mbox = mailbox.mbox(input_mbox_path)
+
+    # Sort messages by Subject
+    sorted_messages = sorted(mbox, key=lambda msg: msg['Subject'])
+
+    # Create a new mbox for the sorted messages
+    sorted_mbox = mailbox.mbox(output_mbox_path)
+    sorted_mbox.lock()
+
+    try:
+        for msg in sorted_messages:
+            sorted_mbox.add(msg)
+        sorted_mbox.flush()
+    finally:
+        sorted_mbox.unlock()
+
+    print(f"Sorted mbox saved to {output_mbox_path}")
