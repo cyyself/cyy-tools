@@ -4,7 +4,10 @@
 
 import sys
 import subprocess
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+BATCH_SIZE = 1024 * 1024  # 512 KB
 
 if __name__ == "__main__":
     args = sys.argv[1:]
@@ -34,22 +37,39 @@ if __name__ == "__main__":
             continue
         parts_after = line[len(addr)+9:].split()
         section = parts_after[0]
+        if section != ".text":
+            continue
         size = parts_after[1]
         name = parts_after[2]
-        functions.append((name, addr))
-    functions.sort(key=lambda x: int(x[1], 16))
+        assert int(addr, 16) != 0
+        functions.append((name, int(addr, 16), int(size, 16)))
+    functions.sort(key=lambda x: x[1])
     # Disassemble functions in parallel
-    def disassemble_function(func_name):
-        disasm_cmd = ["objdump", "--disassemble="+func_name] + args[1:]
+    def disassemble_function(vma_start, vma_end):
+        disasm_cmd = ["objdump", "-D", "--start-address=0x{0:x}".format(vma_start),
+                       "--stop-address=0x{0:x}".format(vma_end)] + args[1:]
         if args[0] == "-S":
             disasm_cmd.insert(1, "-S")
         try:
             output = subprocess.check_output(disasm_cmd, universal_newlines=True)
             return output
         except subprocess.CalledProcessError as e:
-            return f"Error disassembling {func_name}: {e}"
-    with ThreadPoolExecutor() as executor:
-        future_to_func = {executor.submit(disassemble_function, func[0]): func for func in functions}
+            return f"Error disassembling function at 0x{0:x}: {e}".format(vma_start)
+    todo_list = [] # (start, stop)
+    last_end = None
+    for func in functions:
+        if last_end is None:
+            last_end = func[1]
+        if func[1] - last_end >= BATCH_SIZE:
+            todo_list.append((last_end, func[1]))
+            last_end = func[1]
+    if last_end is not None:
+        todo_list.append((last_end, functions[-1][1] + functions[-1][2]))
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        future_to_func = {
+            executor.submit(disassemble_function, start, end): (start, end)
+            for (start, end) in todo_list
+        }
         # Collect and print results as they complete in order
         for future in as_completed(future_to_func):
             func = future_to_func[future]
