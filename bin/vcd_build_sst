@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""
+vcd_build_sst.py - Build a Signal Scope Tree (SST) in a VCD file.
+
+Reads a VCD file where all signals are flat under a single root scope
+with "/" in their names indicating hierarchy (Vivado ILA dump), then
+rewrites the header with proper $scope/$upscope nesting so each signal
+has only its leaf name.
+
+Usage:
+    python3 vcd_build_sst.py <input.vcd> [output.vcd]
+
+If output is omitted, writes to <input>_sst.vcd.
+"""
+
+import sys
+import re
+from collections import OrderedDict
+
+
+def parse_var_line(line):
+    """Parse a $var line and return (type, size, id_code, full_name, bit_range, raw_line).
+    
+    VCD format: $var <type> <size> <id_code> <reference> [<bit_range>] $end
+    """
+    # Strip the $var prefix and $end suffix
+    stripped = line.strip()
+    if not stripped.startswith('$var'):
+        return None
+    stripped = stripped[4:].strip()
+    if stripped.endswith('$end'):
+        stripped = stripped[:-4].strip()
+
+    # Split into tokens: type, size, id_code, then the rest is reference + optional bit_range
+    tokens = stripped.split(None, 3)
+    if len(tokens) < 4:
+        return None
+
+    var_type = tokens[0]
+    var_size = tokens[1]
+    id_code = tokens[2]
+    remainder = tokens[3]
+
+    # Check if there's a bit range like [63:0] at the end
+    bit_range_match = re.search(r'\s+(\[\d+(?::\d+)?\])\s*$', remainder)
+    if bit_range_match:
+        bit_range = bit_range_match.group(1)
+        full_name = remainder[:bit_range_match.start()]
+    else:
+        bit_range = None
+        full_name = remainder
+
+    return var_type, var_size, id_code, full_name.strip(), bit_range
+
+
+class ScopeNode:
+    """A node in the scope tree."""
+    def __init__(self, name):
+        self.name = name
+        self.children = OrderedDict()  # name -> ScopeNode
+        self.signals = []  # list of (var_type, var_size, id_code, leaf_name, bit_range)
+
+
+def build_scope_tree(var_entries, root_name='dut'):
+    """Build a scope tree from parsed var entries.
+    
+    Each entry is (var_type, var_size, id_code, full_name, bit_range).
+    full_name may contain "/" indicating hierarchy.
+    """
+    root = ScopeNode(root_name)
+
+    for var_type, var_size, id_code, full_name, bit_range in var_entries:
+        parts = full_name.split('/')
+        if len(parts) == 1:
+            # No hierarchy, signal goes directly under root
+            root.signals.append((var_type, var_size, id_code, parts[0], bit_range))
+        else:
+            # Navigate/create intermediate scopes
+            node = root
+            for scope_name in parts[:-1]:
+                if scope_name not in node.children:
+                    node.children[scope_name] = ScopeNode(scope_name)
+                node = node.children[scope_name]
+            leaf_name = parts[-1]
+            node.signals.append((var_type, var_size, id_code, leaf_name, bit_range))
+
+    return root
+
+
+def emit_scope_tree(root, lines, indent=0):
+    """Recursively emit $scope/$var/$upscope lines for the tree."""
+    prefix = '  ' * indent
+    lines.append(f'{prefix}$scope module {root.name} $end')
+
+    # Emit signals at this level
+    for var_type, var_size, id_code, leaf_name, bit_range in root.signals:
+        if bit_range:
+            lines.append(f'{prefix}  $var {var_type} {var_size} {id_code} {leaf_name} {bit_range} $end')
+        else:
+            lines.append(f'{prefix}  $var {var_type} {var_size} {id_code} {leaf_name} $end')
+
+    # Emit child scopes
+    for child in root.children.values():
+        emit_scope_tree(child, lines, indent + 1)
+
+    lines.append(f'{prefix}$upscope $end')
+
+
+def process_vcd(input_path, output_path):
+    with open(input_path, 'r') as f:
+        content = f.read()
+
+    # Split into header and data at $enddefinitions
+    m = re.search(r'^\$enddefinitions\s+\$end\s*$', content, re.MULTILINE)
+    if not m:
+        print("Error: Could not find $enddefinitions in VCD file", file=sys.stderr)
+        sys.exit(1)
+
+    header_text = content[:m.start()]
+    data_text = content[m.start():]  # includes $enddefinitions line and everything after
+
+    # Parse header: extract preamble lines (date, version, timescale) and var lines
+    preamble_lines = []
+    var_entries = []
+    root_scope_name = 'dut'
+
+    for line in header_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('$var'):
+            parsed = parse_var_line(stripped)
+            if parsed:
+                var_entries.append(parsed)
+        elif stripped.startswith('$scope'):
+            # Extract root scope name
+            scope_match = re.match(r'\$scope\s+module\s+(\S+)\s+\$end', stripped)
+            if scope_match:
+                root_scope_name = scope_match.group(1)
+        elif stripped.startswith('$upscope'):
+            pass  # skip old upscope
+        else:
+            preamble_lines.append(line)
+
+    # Build scope tree
+    root = build_scope_tree(var_entries, root_scope_name)
+
+    # Emit new header
+    output_lines = []
+    for line in preamble_lines:
+        output_lines.append(line)
+
+    emit_scope_tree(root, output_lines)
+    output_lines.append('')  # blank line before enddefinitions
+
+    # Write output
+    with open(output_path, 'w') as f:
+        f.write('\n'.join(output_lines))
+        f.write('\n')
+        f.write(data_text)
+
+    # Print stats
+    print(f"Input:  {input_path}")
+    print(f"Output: {output_path}")
+    print(f"Signals: {len(var_entries)}")
+
+    # Count scopes
+    def count_scopes(node):
+        return 1 + sum(count_scopes(c) for c in node.children.values())
+    print(f"Scopes:  {count_scopes(root)}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__.strip())
+        sys.exit(1)
+
+    input_path = sys.argv[1]
+    if len(sys.argv) >= 3:
+        output_path = sys.argv[2]
+    else:
+        if input_path.endswith('.vcd'):
+            output_path = input_path[:-4] + '_sst.vcd'
+        else:
+            output_path = input_path + '_sst.vcd'
+
+    process_vcd(input_path, output_path)
+
+
+if __name__ == '__main__':
+    main()
